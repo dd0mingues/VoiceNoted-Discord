@@ -415,12 +415,27 @@ async def sync_names_cmd(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("⚠️ Este comando só pode ser usado dentro de um servidor.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
     cache = guild_known_members.setdefault(interaction.guild.id, set())
+
+    # Try to chunk all members if intent is enabled
+    try:
+        await interaction.guild.chunk()
+    except Exception as e:
+        logger.debug("Chunk de membros ignorado ou não suportado: %s", e)
+
+    # 1. Inspect all members loaded in guild
     for member in interaction.guild.members:
         for n in extract_member_display_names(member):
             cache.add(n)
 
-    await interaction.response.send_message(
+    # 2. Inspect members visible in the current channel
+    if hasattr(interaction.channel, "members"):
+        for member in interaction.channel.members:
+            for n in extract_member_display_names(member):
+                cache.add(n)
+
+    await interaction.followup.send(
         f"🔄 Nomes dos membros sincronizados com sucesso! Total de {len(cache)} nome(s) de exibição registados.",
         ephemeral=True,
     )
