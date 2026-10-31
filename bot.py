@@ -194,9 +194,13 @@ def get_transcription_prompt(guild: discord.Guild | None = None) -> str:
 
 
 def polish_transcript(text: str) -> str:
-    """Post-processes Whisper transcriptions to normalize known gaming terms."""
+    """Post-processes Whisper transcriptions to normalize known gaming terms and phonetic slips."""
     # Ensure 'Guild' is written without an 'e' at the end
-    return re.sub(r'\bguilde\b', 'Guild', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bguilde\b', 'Guild', text, flags=re.IGNORECASE)
+    # Fix 'Redes de 20' -> 'Raids de 20' (common acoustic slip in PT-PT gaming)
+    text = re.sub(r'\b[Rr]edes de (\d+)\b', r'Raids de \1', text)
+    text = re.sub(r'\b[Rr]ede de (\d+)\b', r'Raid de \1', text)
+    return text
 
 
 def format_paragraphs(text: str, max_sentences_per_para: int = 3, max_chars_per_para: int = 280) -> str:
@@ -610,12 +614,15 @@ async def on_message(message: discord.Message) -> None:
                 # Dynamically construct context prompt with gaming terms and member names
                 dynamic_prompt = get_transcription_prompt(message.guild)
 
-                # Send in-memory buffer to Groq Whisper Large-v3 (strictly transcriptions, never translations)
+                # Send in-memory buffer to Groq Whisper (strictly transcriptions, never translations)
+                model_name = os.getenv("GROQ_MODEL", "whisper-large-v3")
+                temperature = float(os.getenv("WHISPER_TEMPERATURE", "0.2"))
+
                 transcription = await groq_client.audio.transcriptions.create(
                     file=(filename, audio_bytes, content_type),
-                    model="whisper-large-v3",
+                    model=model_name,
                     language="pt",
-                    temperature=0.0,
+                    temperature=temperature,
                     prompt=dynamic_prompt,
                 )
 
