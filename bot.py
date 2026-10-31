@@ -138,18 +138,37 @@ def is_audio_attachment(attachment: discord.Attachment) -> bool:
 
 def get_audio_attachments(message: discord.Message) -> list[discord.Attachment]:
     """
-    Identifies audio attachments in a message, checking both the
-    Discord IS_VOICE_MESSAGE bitflag (8192) and standard audio attachments.
+    Identifies audio attachments in a message, checking:
+    1. Direct attachments (including Discord voice notes with IS_VOICE_MESSAGE bitflag 8192).
+    2. Forwarded message snapshots (Discord Message Forwarding feature).
+    3. Referenced messages (replies to older voice notes).
     """
-    if not message.attachments:
-        return []
+    audio_attachments: list[discord.Attachment] = []
 
-    is_voice_message = bool(message.flags.value & VOICE_MESSAGE_FLAG)
-    audio_attachments = []
-
+    # 1. Direct attachments
+    is_direct_voice = bool(message.flags.value & VOICE_MESSAGE_FLAG)
     for attachment in message.attachments:
-        if is_voice_message or is_audio_attachment(attachment):
+        if is_direct_voice or is_audio_attachment(attachment):
             audio_attachments.append(attachment)
+
+    # 2. Forwarded message snapshots (Discord Message Forwarding feature)
+    snapshots = getattr(message, "message_snapshots", None)
+    if snapshots:
+        for snapshot in snapshots:
+            snapshot_flags = getattr(snapshot, "flags", None)
+            is_snapshot_voice = bool(snapshot_flags.value & VOICE_MESSAGE_FLAG) if snapshot_flags else False
+            for attachment in getattr(snapshot, "attachments", []):
+                if is_snapshot_voice or is_audio_attachment(attachment):
+                    audio_attachments.append(attachment)
+
+    # 3. Referenced messages (if a user replies to an existing voice message)
+    if not audio_attachments and message.reference:
+        ref_message = message.reference.resolved
+        if isinstance(ref_message, discord.Message):
+            is_ref_voice = bool(ref_message.flags.value & VOICE_MESSAGE_FLAG)
+            for attachment in ref_message.attachments:
+                if is_ref_voice or is_audio_attachment(attachment):
+                    audio_attachments.append(attachment)
 
     return audio_attachments
 

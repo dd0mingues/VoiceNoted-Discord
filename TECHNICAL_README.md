@@ -64,10 +64,12 @@ Voice messages in Discord are not transmitted via special distinct events; they 
 ```python
 VOICE_MESSAGE_FLAG = 8192  # Bit 13: (1 << 13) IS_VOICE_MESSAGE
 ```
-The detection pipeline executes in $O(1)$ to $O(N)$ attachment inspection:
+The detection pipeline executes across three ingestion vectors:
 1. **Bot Filter**: `if message.author.bot: return` prevents recursive bot loops and self-triggering.
-2. **Flag Evaluation**: Evaluates `bool(message.flags.value & 8192)`. If true, the message was recorded using Discord's official voice message microphone tool on mobile or desktop clients.
-3. **MIME & Extension Fallback**: Inspects `attachment.content_type` (`audio/*`) and file extensions (`.ogg`, `.mp3`, `.wav`, `.m4a`) to accommodate audio files dragged into chat.
+2. **Direct Attachments & Voice Flags**: Evaluates `bool(message.flags.value & 8192)`. If true, the message is a native Discord voice message. Evaluates `content_type` (`audio/*`) and extensions (`.ogg`, `.mp3`, `.wav`, `.m4a`).
+3. **Forwarded Messages (Discord `message_snapshots`)**: Discord's Message Forwarding feature does not populate top-level `message.attachments`. Instead, it embeds `message.message_snapshots`, containing snapshots of the original message and its attachments. The pipeline traverses `snapshot.attachments` and checks `snapshot.flags` for bit `8192`.
+4. **Referenced Messages (Replies)**: If a user replies to an existing voice message with a mention, `message.reference.resolved` is queried for historical audio payloads.
+
 
 ---
 
