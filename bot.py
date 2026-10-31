@@ -240,7 +240,56 @@ def format_paragraphs(text: str, max_sentences_per_para: int = 3, max_chars_per_
     return "\n\n".join(paragraphs)
 
 
+def split_text(text: str, max_length: int = 1900) -> list[str]:
+    """
+    Splits long transcripts cleanly on paragraph boundaries (\\n\\n),
+    sentence boundaries (. , ! , ? , \\n), or spaces without cutting words in half.
+    """
+    if not text:
+        return []
 
+    text = text.strip()
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while len(remaining) > max_length:
+        segment = remaining[:max_length]
+        split_pos = -1
+
+        # 1. Priority 1: Paragraph boundaries (\n\n)
+        pos = segment.rfind("\n\n")
+        if pos != -1:
+            split_pos = pos + 2
+
+        # 2. Priority 2: Sentence boundaries (. , ! , ? , \n)
+        if split_pos <= 0:
+            for sep in ("\n", ". ", "! ", "? "):
+                pos = segment.rfind(sep)
+                if pos != -1:
+                    candidate_pos = pos + len(sep)
+                    if candidate_pos > split_pos:
+                        split_pos = candidate_pos
+
+        # 3. Priority 3: Whitespace
+        if split_pos <= 0:
+            split_pos = segment.rfind(" ")
+
+        # 4. Fallback: hard cut
+        if split_pos <= 0:
+            split_pos = max_length
+
+        chunk = remaining[:split_pos].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_pos:].strip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
 
 
 def is_audio_attachment(attachment: discord.Attachment) -> bool:
