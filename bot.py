@@ -80,10 +80,13 @@ def save_custom_words(data: dict[str, list[str]]) -> None:
 
 # Context prompt template for European Portuguese (PT-PT) with WoW/gaming terminology
 BASE_TRANSCRIPTION_PROMPT = (
-    "Transcrição em português de Portugal (PT-PT) de uma conversa entre gamers sobre World of Warcraft (WoW). "
-    "Manter termos em inglês quando ditos: Guild (escrever sempre Guild, nunca guilde), Guild Master, GM, Raid, "
-    "Raid Leader, RL, PUG, pugar, loot, loot drama, wipe, boss, aggro, pull, tank, healer, DPS, mythic, M+, "
-    "dungeon, addon, Discord, spreadsheet, Paint. Calão português: gajos, malta, cenas, fixe, caralho, foda-se, caraças, acumulado."
+    "Transcrição PT-PT de áudio casual de Discord entre gamers de World of Warcraft (WoW), "
+    "a falar à vontade ou a conduzir em vez de estar a escrever no chat. "
+    "Sem títulos formais (Dr., Doutor). "
+    "Termos WoW: 10-man, 20-man, 40-man, 10-mans, 20-mans, Raids de 10/20, Guild (nunca guilde), "
+    "GM, Raid Leader, RL, PUG, pugar, roster, bench, core, loot, wipe, boss, aggro, pull, tank, "
+    "healer, DPS, M+, dungeon, addon, reset. "
+    "Calão PT: gajos, malta, cenas, fixe, caralho, foda-se, caraças."
 )
 
 # Common Whisper hallucinations on silent or background-noise-only audio
@@ -186,8 +189,8 @@ def get_transcription_prompt(guild: discord.Guild | None = None) -> str:
                     names.add(n)
 
     if names:
-        # Keep top ~30 names/words to stay comfortably within Whisper prompt context limits
-        top_names = sorted(names)[:35]
+        # Limitar a 20 nomes para garantir que não ultrapassa os 224 tokens do Whisper
+        top_names = sorted(names)[:20]
         return f"{BASE_TRANSCRIPTION_PROMPT} Nomes e termos deste servidor: {', '.join(top_names)}."
 
     return BASE_TRANSCRIPTION_PROMPT
@@ -197,9 +200,29 @@ def polish_transcript(text: str) -> str:
     """Post-processes Whisper transcriptions to normalize known gaming terms and phonetic slips."""
     # Ensure 'Guild' is written without an 'e' at the end
     text = re.sub(r'\bguilde\b', 'Guild', text, flags=re.IGNORECASE)
-    # Fix 'Redes de 20' -> 'Raids de 20' (common acoustic slip in PT-PT gaming)
+
+    # Correção fonética: "em vez de estar aqui a escrever" confundido com "o Dr. Aguiar escreveu"
+    text = re.sub(
+        r'\b(?:em\s+vez\s+d[oe]\s+|o\s+)?[Dd](?:r\.?|outor)\s+Aguiar\s+escreve[ur]\b',
+        'em vez de estar aqui a escrever',
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalização de formatos de raid (10-man, 20-man, etc.)
+    text = re.sub(r'\b(\d+)\s+mans\b', r'\1-mans', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(\d+)\s+man\b', r'\1-man', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(\d+)\s*-\s*man\b', r'\1-man', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(\d+)\s*-\s*mans\b', r'\1-mans', text, flags=re.IGNORECASE)
+
+    # Deslizes acústicos: "Redes de 20" -> "Raids de 20"
     text = re.sub(r'\b[Rr]edes de (\d+)\b', r'Raids de \1', text)
     text = re.sub(r'\b[Rr]ede de (\d+)\b', r'Raid de \1', text)
+
+    # Deslizes acústicos em contexto de raid: "20 manos" -> "20-man"
+    text = re.sub(r'\b(raids?|conteúdo)\s+de\s+(\d+)\s+manos\b', r'\1 de \2-man', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(\d+)\s+manos\s+([Rr]aids?|[Rr]edes?)\b', r'\1-man Raids', text, flags=re.IGNORECASE)
+
     return text
 
 
