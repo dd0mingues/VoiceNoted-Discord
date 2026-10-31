@@ -17,6 +17,21 @@ Bot de Discord de alta performance e pronto para produção que transcreve autom
 
 ---
 
+## ⚡ Comandos do Bot (Slash Commands)
+
+O VoiceNoted disponibiliza comandos de barra (`/`) para gerir o vocabulário e nomes reconhecidos em cada servidor:
+
+| Comando | Descrição | Exemplo de Uso |
+| :--- | :--- | :--- |
+| **`/voicenoted addword`** | Adiciona uma palavra, alcunha, nome de boss ou jargão personalizado ao vocabulário persistente deste servidor. | `/voicenoted addword word:Caramel` |
+| **`/voicenoted removeword`** | Remove uma palavra personalizada adicionada anteriormente. | `/voicenoted removeword word:Caramel` |
+| **`/voicenoted listwords`** | Mostra a lista de palavras personalizadas guardadas e os nomes de membros atualmente em cache. | `/voicenoted listwords` |
+| **`/voicenoted syncnames`** | Força a sincronização imediata dos apelidos e nomes de exibição de todos os membros do servidor. | `/voicenoted syncnames` |
+
+> 💡 **Nota**: O VoiceNoted também aprende **automaticamente** os nomes de exibição dos membros sempre que alguém envia mensagens, junta-se ao servidor ou atualiza a sua alcunha!
+
+---
+
 ## 📋 Pré-Requisitos
 
 - **Python 3.11+** (ou Docker)
