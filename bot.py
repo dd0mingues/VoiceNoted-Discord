@@ -1,7 +1,10 @@
+import json
 import logging
 import os
+import re
 import sys
 import discord
+from discord import app_commands
 from dotenv import load_dotenv
 from groq import AsyncGroq
 
@@ -51,7 +54,29 @@ MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB Groq Whisper API limit
 VOICE_MESSAGE_FLAG = 8192  # Discord's IS_VOICE_MESSAGE bitflag (1 << 13)
 AUDIO_EXTENSIONS = (".ogg", ".mp3", ".wav", ".m4a")
 
-import re
+# Custom words persistence file for guild vocabularies
+CUSTOM_WORDS_FILE = "custom_words.json"
+
+
+def load_custom_words() -> dict[str, list[str]]:
+    """Loads persistent custom words and jargon per guild from custom_words.json."""
+    if os.path.exists(CUSTOM_WORDS_FILE):
+        try:
+            with open(CUSTOM_WORDS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error("Erro ao carregar ficheiro de palavras personalizadas: %s", e)
+    return {}
+
+
+def save_custom_words(data: dict[str, list[str]]) -> None:
+    """Saves persistent custom words to custom_words.json."""
+    try:
+        with open(CUSTOM_WORDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Erro ao guardar ficheiro de palavras personalizadas: %s", e)
+
 
 # Context prompt template for European Portuguese (PT-PT) with WoW/gaming terminology
 BASE_TRANSCRIPTION_PROMPT = (
@@ -82,112 +107,88 @@ HALLUCINATION_PHRASES = {
     ".",
 }
 
-# In-memory registry of seen member names and nicknames per guild
+# In-memory cache of server member display names per guild
 guild_known_members: dict[int, set[str]] = {}
 
 
-def generate_name_variants(raw_name: str) -> list[str]:
-    """Generates base names and common shortened variants for a gamer username or nickname."""
-    if not raw_name:
-        return []
-
-    variants: set[str] = set()
-
-    # 1. Strip trailing numbers, underscores, and punctuation (e.g. "BrunoSilva99" -> "BrunoSilva", "staav." -> "staav")
-    cleaned = re.sub(r'[\._\-\d]+$', '', raw_name).strip()
-    cleaned = re.sub(r'^[\._\-]+', '', cleaned).strip()
-    if len(cleaned) >= 2:
-        variants.add(cleaned)
-
-    # 2. Multi-word names: extract individual words (e.g. "Bruno Silva" -> "Bruno")
-    words = raw_name.split()
-    if len(words) > 1:
-        for w in words:
-            clean_w = re.sub(r'[\._\-\d]+', '', w).strip()
-            if len(clean_w) >= 3:
-                variants.add(clean_w)
-
-    # 3. CamelCase splitting (e.g. "DarkSlayer" -> "Dark", "Slayer")
-    camel_parts = re.findall(r'[A-Z][a-z0-9]+', raw_name)
-    if len(camel_parts) > 1:
-        for p in camel_parts:
-            if len(p) >= 3:
-                variants.add(p)
-
-    # 4. Portuguese root reductions (e.g. "Caramelo" -> "Caramel")
-    for v in list(variants):
-        if v.lower().endswith(("elo", "ela")) and len(v) > 4:
-            variants.add(v[:-1])
-
-    return [v for v in sorted(variants) if len(v) >= 2 and not v.isdigit()]
-
-
-def extract_member_aliases(member: discord.Member | discord.User) -> list[str]:
-    """Extracts all recognizable display names and aliases for a Discord member."""
+def extract_member_display_names(member: discord.Member | discord.User) -> list[str]:
+    """
+    Extracts ONLY the real server display name and, if multi-word,
+    the primary first word (e.g. 'Bruno Silva' -> ['Bruno Silva', 'Bruno']).
+    Strictly avoids artificial suffixes, guessing, or loose reductions.
+    """
     if member.bot:
         return []
 
-    candidates: set[str] = set()
-    nick = getattr(member, "nick", None)
-    if nick:
-        candidates.add(nick)
-    display_name = getattr(member, "display_name", None)
-    if display_name:
-        candidates.add(display_name)
-    global_name = getattr(member, "global_name", None)
-    if global_name:
-        candidates.add(global_name)
-    if member.name:
-        candidates.add(member.name)
+    display = member.display_name.strip()
+    if not display:
+        return []
 
-    all_variants: set[str] = set()
-    for c in candidates:
-        all_variants.add(c)
-        for v in generate_name_variants(c):
-            all_variants.add(v)
+    results: set[str] = {display}
+    # If the display name has multiple words (e.g. "Bruno Silva"), also include the first word
+    words = display.split()
+    if len(words) > 1 and len(words[0]) >= 3:
+        results.add(words[0])
 
-    return [v for v in sorted(all_variants) if len(v) >= 2]
+    return list(results)
 
 
 def track_guild_member(guild: discord.Guild | None, member: discord.Member | discord.User) -> None:
-    """Caches member names dynamically when they send messages or are seen in guilds."""
+    """Caches a member's display name when they speak or join."""
     if not guild or member.bot:
         return
     if guild.id not in guild_known_members:
         guild_known_members[guild.id] = set()
 
-    for alias in extract_member_aliases(member):
-        guild_known_members[guild.id].add(alias)
+    for name in extract_member_display_names(member):
+        guild_known_members[guild.id].add(name)
+
+
+def update_member_in_cache(guild: discord.Guild | None, before: discord.Member, after: discord.Member) -> None:
+    """Updates the cached display names when a member updates their server nickname."""
+    if not guild or after.bot:
+        return
+    cache = guild_known_members.setdefault(guild.id, set())
+    for old_name in extract_member_display_names(before):
+        cache.discard(old_name)
+    for new_name in extract_member_display_names(after):
+        cache.add(new_name)
 
 
 def get_transcription_prompt(guild: discord.Guild | None = None) -> str:
     """
     Constructs a contextual Whisper prompt containing WoW jargon, PT-PT slang,
-    and dynamically extracted server member names and shortened nicknames.
+    real server member display names, and words added via /voicenoted addword.
     """
     names: set[str] = set()
 
-    # 1. Custom names from environment variables (e.g. CUSTOM_NAMES="Caramelo, Caramel, Bruno, Rotorv")
+    # 1. Custom names from environment variables (optional)
     custom_names_env = os.getenv("CUSTOM_NAMES", "")
     if custom_names_env:
         for n in custom_names_env.split(","):
             if n.strip():
                 names.add(n.strip())
 
-    # 2. Add cached/tracked members from the guild
-    if guild and guild.id in guild_known_members:
-        names.update(guild_known_members[guild.id])
+    # 2. Custom words registered via /voicenoted addword for this guild
+    if guild:
+        custom_words_data = load_custom_words()
+        for w in custom_words_data.get(str(guild.id), []):
+            if w.strip():
+                names.add(w.strip())
 
-    # 3. Add loaded guild members if available
-    if guild and guild.members:
-        for m in guild.members:
-            for alias in extract_member_aliases(m):
-                names.add(alias)
+    # 3. Add real member display names (from cache and guild.members)
+    if guild:
+        if guild.id in guild_known_members:
+            names.update(guild_known_members[guild.id])
+        if guild.members:
+            for m in guild.members:
+                for n in extract_member_display_names(m):
+                    names.add(n)
 
     if names:
-        # Keep top 30 aliases to stay comfortably within Whisper prompt context limits
+        # Keep top ~30 names/words to stay comfortably within Whisper prompt context limits
         top_names = sorted(names)[:35]
-        return f"{BASE_TRANSCRIPTION_PROMPT} Nomes dos membros da guilde/servidor: {', '.join(top_names)}."
+        return f"{BASE_TRANSCRIPTION_PROMPT} Nomes e termos deste servidor: {', '.join(top_names)}."
 
     return BASE_TRANSCRIPTION_PROMPT
 
@@ -301,7 +302,11 @@ if ENABLE_MEMBERS_INTENT:
 
 
 class VoiceNotedClient(discord.Client):
-    """Discord client with optional background health-check HTTP server for cloud platforms (e.g. Render)."""
+    """Discord client with app_commands and optional background health-check HTTP server for cloud platforms."""
+
+    def __init__(self, *, intents: discord.Intents) -> None:
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
         port = os.getenv("PORT")
@@ -330,6 +335,128 @@ class VoiceNotedClient(discord.Client):
 
 client = VoiceNotedClient(intents=intents)
 
+# Slash command group /voicenoted
+voicenoted_group = app_commands.Group(
+    name="voicenoted",
+    description="Comandos para gerir o vocabulário e nomes do VoiceNoted",
+)
+
+
+@voicenoted_group.command(name="addword", description="Adiciona uma palavra, nome ou jargão ao vocabulário de transcrição")
+@app_commands.describe(word="A palavra, nome ou jargão a adicionar (ex: Caramelo, Tank, Healer, Ragnaros)")
+async def add_word_cmd(interaction: discord.Interaction, word: str) -> None:
+    guild_id = str(interaction.guild_id) if interaction.guild_id else "global"
+    clean_word = word.strip()
+    if not clean_word:
+        await interaction.response.send_message("⚠️ Por favor introduz uma palavra válida.", ephemeral=True)
+        return
+
+    data = load_custom_words()
+    guild_words = data.setdefault(guild_id, [])
+    if clean_word not in guild_words:
+        guild_words.append(clean_word)
+        save_custom_words(data)
+        logger.info("Palavra '%s' adicionada ao vocabulário do servidor %s por %s", clean_word, guild_id, interaction.user)
+        await interaction.response.send_message(
+            f"✅ A palavra **`{clean_word}`** foi adicionada ao vocabulário de transcrição deste servidor!",
+        )
+    else:
+        await interaction.response.send_message(
+            f"ℹ️ A palavra **`{clean_word}`** já existia no vocabulário deste servidor.",
+            ephemeral=True,
+        )
+
+
+@voicenoted_group.command(name="removeword", description="Remove uma palavra personalizada do vocabulário")
+@app_commands.describe(word="A palavra a remover")
+async def remove_word_cmd(interaction: discord.Interaction, word: str) -> None:
+    guild_id = str(interaction.guild_id) if interaction.guild_id else "global"
+    clean_word = word.strip()
+
+    data = load_custom_words()
+    guild_words = data.get(guild_id, [])
+    if clean_word in guild_words:
+        guild_words.remove(clean_word)
+        save_custom_words(data)
+        logger.info("Palavra '%s' removida do vocabulário do servidor %s por %s", clean_word, guild_id, interaction.user)
+        await interaction.response.send_message(f"🗑️ A palavra **`{clean_word}`** foi removida do vocabulário.")
+    else:
+        await interaction.response.send_message(
+            f"⚠️ A palavra **`{clean_word}`** não foi encontrada no vocabulário personalizado.",
+            ephemeral=True,
+        )
+
+
+@voicenoted_group.command(name="listwords", description="Lista as palavras e nomes reconhecidos neste servidor")
+async def list_words_cmd(interaction: discord.Interaction) -> None:
+    guild_id = str(interaction.guild_id) if interaction.guild_id else "global"
+    data = load_custom_words()
+    custom_list = data.get(guild_id, [])
+
+    cached_members = sorted(guild_known_members.get(interaction.guild_id, set())) if interaction.guild_id else []
+
+    msg_lines = ["📋 **Vocabulário de Transcrição do Servidor:**\n"]
+    if custom_list:
+        msg_lines.append(f"**Palavras Personalizadas (/voicenoted addword):**\n`{', '.join(custom_list)}`\n")
+    else:
+        msg_lines.append("*Nenhuma palavra personalizada adicionada ainda (usa `/voicenoted addword <palavra>`).*\n")
+
+    if cached_members:
+        msg_lines.append(f"**Nomes de Membros Reconhecidos:**\n`{', '.join(cached_members)}`")
+    else:
+        msg_lines.append("*Nenhum nome de membro em cache ainda.*")
+
+    await interaction.response.send_message("\n".join(msg_lines), ephemeral=True)
+
+
+@voicenoted_group.command(name="syncnames", description="Força a sincronização imediata dos nomes de exibição dos membros")
+async def sync_names_cmd(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("⚠️ Este comando só pode ser usado dentro de um servidor.", ephemeral=True)
+        return
+
+    cache = guild_known_members.setdefault(interaction.guild.id, set())
+    for member in interaction.guild.members:
+        for n in extract_member_display_names(member):
+            cache.add(n)
+
+    await interaction.response.send_message(
+        f"🔄 Nomes dos membros sincronizados com sucesso! Total de {len(cache)} nome(s) de exibição registados.",
+        ephemeral=True,
+    )
+
+
+client.tree.add_command(voicenoted_group)
+
+
+@client.event
+async def on_member_join(member: discord.Member) -> None:
+    """Automatically learns the display name of newly joined members."""
+    if member.guild:
+        track_guild_member(member.guild, member)
+        logger.info("Novo membro no servidor '%s': '%s' adicionado ao vocabulário", member.guild.name, member.display_name)
+
+
+@client.event
+async def on_member_remove(member: discord.Member) -> None:
+    """Removes leaving members from dynamic vocabulary."""
+    if member.guild and member.guild.id in guild_known_members:
+        for name in extract_member_display_names(member):
+            guild_known_members[member.guild.id].discard(name)
+
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    """Automatically updates vocabulary when a member updates their server nickname or display name."""
+    if before.display_name != after.display_name and after.guild:
+        update_member_in_cache(after.guild, before, after)
+        logger.info(
+            "Membro atualizou nome em '%s': '%s' -> '%s'",
+            after.guild.name,
+            before.display_name,
+            after.display_name,
+        )
+
 
 @client.event
 async def on_ready() -> None:
@@ -337,11 +464,21 @@ async def on_ready() -> None:
     logger.info("==================================================")
     logger.info("Bot autenticado como: %s (ID: %s)", client.user.name, client.user.id)
     logger.info("Conectado a %d servidor(es)", len(client.guilds))
+
     for guild in client.guilds:
+        # Sync slash commands to each guild immediately for instant appearance
+        try:
+            client.tree.copy_global_to(guild=guild)
+            await client.tree.sync(guild=guild)
+            logger.info("Comandos slash /voicenoted sincronizados no servidor '%s'", guild.name)
+        except Exception as e:
+            logger.warning("Não foi possível sincronizar slash commands no servidor '%s': %s", guild.name, e)
+
+        # Cache member display names
         for member in guild.members:
             track_guild_member(guild, member)
         cached_count = len(guild_known_members.get(guild.id, set()))
-        logger.info("Servidor '%s': %d nome(s)/alcunha(s) registados no vocabulário", guild.name, cached_count)
+        logger.info("Servidor '%s': %d nome(s) de exibição registados no vocabulário", guild.name, cached_count)
 
     logger.info(
         "Intents configurados - message_content: True, voice_states: False, members: %s",
