@@ -11,7 +11,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("TranscribeBot")
+logger = logging.getLogger("VoiceNoted")
 
 # Load environment variables
 load_dotenv()
@@ -311,7 +311,7 @@ async def on_message(message: discord.Message) -> None:
 def main() -> None:
     """Bot entry point."""
     validate_environment()
-    logger.info("A iniciar Discord Transcribe Bot...")
+    logger.info("A iniciar VoiceNoted Discord Bot...")
     client.run(DISCORD_TOKEN)
 
 

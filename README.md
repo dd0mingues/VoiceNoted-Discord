@@ -40,7 +40,7 @@ Bot de Discord de alta performance e pronto para produção que transcreve autom
 
 1. Aceda ao [Discord Developer Portal](https://discord.com/developers/applications).
 2. Clique no botão **New Application** no canto superior direito.
-3. Introduza um nome (ex: `TranscribeBot`) e clique em **Create**.
+3. Introduza um nome (ex: `VoiceNoted`) e clique em **Create**.
 4. No menu lateral esquerdo, clique em **Bot**:
    - Em **Build-A-Bot**, clique em **Reset Token** e copie o seu **DISCORD_TOKEN**. Guarde-o num local seguro.
    - Desça até à secção **Privileged Gateway Intents**:
@@ -131,23 +131,23 @@ Para hospedar o bot continuamente numa VPS (Oracle Cloud, DigitalOcean, Hetzner,
 
 ```bash
 # 1. Construir a imagem Docker
-docker build -t transcribe-bot .
+docker build -t voicenoted-discord .
 
 # 2. Executar o contentor em background com reinício automático
 docker run -d \
-  --name transcribe-bot \
+  --name voicenoted-discord \
   --env-file .env \
   --restart unless-stopped \
   --memory 512m \
-  transcribe-bot
+  voicenoted-discord
 
 # 3. Verificar os logs em tempo real
-docker logs -f transcribe-bot
+docker logs -f voicenoted-discord
 ```
 
 Para parar o bot:
 ```bash
-docker stop transcribe-bot
+docker stop voicenoted-discord
 ```
 
 ---
