@@ -51,12 +51,14 @@ MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB Groq Whisper API limit
 VOICE_MESSAGE_FLAG = 8192  # Discord's IS_VOICE_MESSAGE bitflag (1 << 13)
 AUDIO_EXTENSIONS = (".ogg", ".mp3", ".wav", ".m4a")
 
-# Context prompt for European Portuguese (PT-PT) with WoW/gaming terminology
-TRANSCRIPTION_PROMPT = (
+import re
+
+# Context prompt template for European Portuguese (PT-PT) with WoW/gaming terminology
+BASE_TRANSCRIPTION_PROMPT = (
     "Transcrição em português de Portugal (PT-PT) de uma conversa entre gamers sobre World of Warcraft (WoW). "
-    "Manter termos em inglês quando ditos: Guild, Guild Master, GM, Raid, Raid Leader, RL, PUG, pugar, "
-    "loot, loot drama, wipe, boss, aggro, pull, tank, healer, DPS, mythic, M+, dungeon, addon, Discord. "
-    "Calão português: gajos, malta, cenas, fixe, caralho, caraças, acumulado."
+    "Manter termos em inglês quando ditos: Guild (escrever sempre Guild, nunca guilde), Guild Master, GM, Raid, "
+    "Raid Leader, RL, PUG, pugar, loot, loot drama, wipe, boss, aggro, pull, tank, healer, DPS, mythic, M+, "
+    "dungeon, addon, Discord, spreadsheet, Paint. Calão português: gajos, malta, cenas, fixe, caralho, foda-se, caraças, acumulado."
 )
 
 # Common Whisper hallucinations on silent or background-noise-only audio
@@ -80,51 +82,164 @@ HALLUCINATION_PHRASES = {
     ".",
 }
 
+# In-memory registry of seen member names and nicknames per guild
+guild_known_members: dict[int, set[str]] = {}
 
-def split_text(text: str, max_length: int = 1900) -> list[str]:
-    """
-    Splits long transcripts cleanly on sentence boundaries (. , ! , ? , \\n)
-    or spaces without cutting words in half, ensuring messages stay within Discord limits.
-    """
-    if not text:
+
+def generate_name_variants(raw_name: str) -> list[str]:
+    """Generates base names and common shortened variants for a gamer username or nickname."""
+    if not raw_name:
         return []
 
-    text = text.strip()
-    if len(text) <= max_length:
-        return [text]
+    variants: set[str] = set()
 
-    chunks: list[str] = []
-    remaining = text
+    # 1. Strip trailing numbers, underscores, and punctuation (e.g. "BrunoSilva99" -> "BrunoSilva", "staav." -> "staav")
+    cleaned = re.sub(r'[\._\-\d]+$', '', raw_name).strip()
+    cleaned = re.sub(r'^[\._\-]+', '', cleaned).strip()
+    if len(cleaned) >= 2:
+        variants.add(cleaned)
 
-    while len(remaining) > max_length:
-        segment = remaining[:max_length]
-        split_pos = -1
+    # 2. Multi-word names: extract individual words (e.g. "Bruno Silva" -> "Bruno")
+    words = raw_name.split()
+    if len(words) > 1:
+        for w in words:
+            clean_w = re.sub(r'[\._\-\d]+', '', w).strip()
+            if len(clean_w) >= 3:
+                variants.add(clean_w)
 
-        # 1. Search for sentence boundaries (. , ! , ? , \n)
-        for sep in ("\n", ". ", "! ", "? "):
-            pos = segment.rfind(sep)
-            if pos != -1:
-                candidate_pos = pos + len(sep)
-                if candidate_pos > split_pos:
-                    split_pos = candidate_pos
+    # 3. CamelCase splitting (e.g. "DarkSlayer" -> "Dark", "Slayer")
+    camel_parts = re.findall(r'[A-Z][a-z0-9]+', raw_name)
+    if len(camel_parts) > 1:
+        for p in camel_parts:
+            if len(p) >= 3:
+                variants.add(p)
 
-        # 2. If no sentence boundary found, search for space
-        if split_pos <= 0:
-            split_pos = segment.rfind(" ")
+    # 4. Portuguese root reductions (e.g. "Caramelo" -> "Caramel")
+    for v in list(variants):
+        if v.lower().endswith(("elo", "ela")) and len(v) > 4:
+            variants.add(v[:-1])
 
-        # 3. Fallback: hard cut if a single continuous token exceeds max_length
-        if split_pos <= 0:
-            split_pos = max_length
+    return [v for v in sorted(variants) if len(v) >= 2 and not v.isdigit()]
 
-        chunk = remaining[:split_pos].strip()
-        if chunk:
-            chunks.append(chunk)
-        remaining = remaining[split_pos:].strip()
 
-    if remaining:
-        chunks.append(remaining)
+def extract_member_aliases(member: discord.Member | discord.User) -> list[str]:
+    """Extracts all recognizable display names and aliases for a Discord member."""
+    if member.bot:
+        return []
 
-    return chunks
+    candidates: set[str] = set()
+    nick = getattr(member, "nick", None)
+    if nick:
+        candidates.add(nick)
+    display_name = getattr(member, "display_name", None)
+    if display_name:
+        candidates.add(display_name)
+    global_name = getattr(member, "global_name", None)
+    if global_name:
+        candidates.add(global_name)
+    if member.name:
+        candidates.add(member.name)
+
+    all_variants: set[str] = set()
+    for c in candidates:
+        all_variants.add(c)
+        for v in generate_name_variants(c):
+            all_variants.add(v)
+
+    return [v for v in sorted(all_variants) if len(v) >= 2]
+
+
+def track_guild_member(guild: discord.Guild | None, member: discord.Member | discord.User) -> None:
+    """Caches member names dynamically when they send messages or are seen in guilds."""
+    if not guild or member.bot:
+        return
+    if guild.id not in guild_known_members:
+        guild_known_members[guild.id] = set()
+
+    for alias in extract_member_aliases(member):
+        guild_known_members[guild.id].add(alias)
+
+
+def get_transcription_prompt(guild: discord.Guild | None = None) -> str:
+    """
+    Constructs a contextual Whisper prompt containing WoW jargon, PT-PT slang,
+    and dynamically extracted server member names and shortened nicknames.
+    """
+    names: set[str] = set()
+
+    # 1. Custom names from environment variables (e.g. CUSTOM_NAMES="Caramelo, Caramel, Bruno, Rotorv")
+    custom_names_env = os.getenv("CUSTOM_NAMES", "")
+    if custom_names_env:
+        for n in custom_names_env.split(","):
+            if n.strip():
+                names.add(n.strip())
+
+    # 2. Add cached/tracked members from the guild
+    if guild and guild.id in guild_known_members:
+        names.update(guild_known_members[guild.id])
+
+    # 3. Add loaded guild members if available
+    if guild and guild.members:
+        for m in guild.members:
+            for alias in extract_member_aliases(m):
+                names.add(alias)
+
+    if names:
+        # Keep top 30 aliases to stay comfortably within Whisper prompt context limits
+        top_names = sorted(names)[:35]
+        return f"{BASE_TRANSCRIPTION_PROMPT} Nomes dos membros da guilde/servidor: {', '.join(top_names)}."
+
+    return BASE_TRANSCRIPTION_PROMPT
+
+
+def polish_transcript(text: str) -> str:
+    """Post-processes Whisper transcriptions to normalize known gaming terms."""
+    # Ensure 'Guild' is written without an 'e' at the end
+    return re.sub(r'\bguilde\b', 'Guild', text, flags=re.IGNORECASE)
+
+
+def format_paragraphs(text: str, max_sentences_per_para: int = 3, max_chars_per_para: int = 280) -> str:
+    """
+    Splits continuous transcription text into readable, natural paragraphs
+    separated by blank lines for clean Discord presentation.
+    """
+    if not text:
+        return ""
+
+    # Split text into sentences retaining punctuation
+    sentence_pattern = re.compile(r'([.!?]+[\s]+)')
+    parts = sentence_pattern.split(text.strip())
+
+    sentences: list[str] = []
+    for i in range(0, len(parts) - 1, 2):
+        s = parts[i] + parts[i + 1]
+        if s.strip():
+            sentences.append(s.strip())
+    if len(parts) % 2 == 1 and parts[-1].strip():
+        sentences.append(parts[-1].strip())
+
+    if not sentences:
+        return text
+
+    paragraphs: list[str] = []
+    current_para: list[str] = []
+    current_len = 0
+
+    for sentence in sentences:
+        current_para.append(sentence)
+        current_len += len(sentence)
+        if len(current_para) >= max_sentences_per_para or current_len >= max_chars_per_para:
+            paragraphs.append(" ".join(current_para))
+            current_para = []
+            current_len = 0
+
+    if current_para:
+        paragraphs.append(" ".join(current_para))
+
+    return "\n\n".join(paragraphs)
+
+
+
 
 
 def is_audio_attachment(attachment: discord.Attachment) -> bool:
@@ -180,6 +295,11 @@ intents.message_content = True
 intents.messages = True
 intents.voice_states = False
 
+ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "false").lower() == "true"
+if ENABLE_MEMBERS_INTENT:
+    intents.members = True
+
+
 class VoiceNotedClient(discord.Client):
     """Discord client with optional background health-check HTTP server for cloud platforms (e.g. Render)."""
 
@@ -217,7 +337,16 @@ async def on_ready() -> None:
     logger.info("==================================================")
     logger.info("Bot autenticado como: %s (ID: %s)", client.user.name, client.user.id)
     logger.info("Conectado a %d servidor(es)", len(client.guilds))
-    logger.info("Intents configurados - message_content: True, voice_states: False")
+    for guild in client.guilds:
+        for member in guild.members:
+            track_guild_member(guild, member)
+        cached_count = len(guild_known_members.get(guild.id, set()))
+        logger.info("Servidor '%s': %d nome(s)/alcunha(s) registados no vocabulário", guild.name, cached_count)
+
+    logger.info(
+        "Intents configurados - message_content: True, voice_states: False, members: %s",
+        ENABLE_MEMBERS_INTENT,
+    )
     logger.info("Pronto para transcrever notas de voz (PT-PT)!")
     logger.info("==================================================")
 
@@ -228,6 +357,10 @@ async def on_message(message: discord.Message) -> None:
     # Ignore messages sent by bots (including our own messages)
     if message.author.bot:
         return
+
+    # Dynamically register author names/nicknames into guild vocabulary
+    if message.guild:
+        track_guild_member(message.guild, message.author)
 
     # Check for voice messages or audio attachments
     audio_attachments = get_audio_attachments(message)
@@ -273,13 +406,16 @@ async def on_message(message: discord.Message) -> None:
                     len(audio_bytes),
                 )
 
+                # Dynamically construct context prompt with gaming terms and member names
+                dynamic_prompt = get_transcription_prompt(message.guild)
+
                 # Send in-memory buffer to Groq Whisper Large-v3 (strictly transcriptions, never translations)
                 transcription = await groq_client.audio.transcriptions.create(
                     file=(filename, audio_bytes, content_type),
                     model="whisper-large-v3",
                     language="pt",
                     temperature=0.0,
-                    prompt=TRANSCRIPTION_PROMPT,
+                    prompt=dynamic_prompt,
                 )
 
                 raw_text = transcription.text.strip() if transcription.text else ""
@@ -297,13 +433,24 @@ async def on_message(message: discord.Message) -> None:
                     )
                     continue
 
+                # Polish gaming terminology and format into readable paragraphs
+                polished_text = polish_transcript(raw_text)
+                formatted_text = format_paragraphs(polished_text)
+
                 # Split long transcripts cleanly (under Discord 2000-char limit)
-                chunks = split_text(raw_text, max_length=1900)
+                chunks = split_text(formatted_text, max_length=1900)
                 if not chunks:
                     continue
 
+                # Determine header based on whether audio was forwarded or recorded directly
+                is_forwarded = bool(getattr(message, "message_snapshots", None))
+                if is_forwarded:
+                    header = f"🎙️ **Transcrição** • *Nota Encaminhada (enviada por **{message.author.display_name}**)*"
+                else:
+                    header = f"🎙️ **Transcrição** • *(áudio de **{message.author.display_name}**)*"
+
                 # Reply to the original voice message with the first chunk
-                first_reply = f"🎙️ **Transcrição:**\n{chunks[0]}"
+                first_reply = f"{header}\n\n{chunks[0]}"
                 await message.reply(first_reply, mention_author=False)
 
                 # Send subsequent chunks sequentially as follow-ups
